@@ -1,0 +1,24 @@
+function doPost(e){
+  try{
+    const raw = e.postData && e.postData.contents ? e.postData.contents : '{}';
+    const data = JSON.parse(raw);
+    const sheetName = String(data.sheet || 'roster');
+    if(data.action === 'bulkUpdateNumber'){
+      // data.changes: [{item, number, ...}, ...]
+      const n = bulkUpdateNumber_(sheetName, data.changes || []);
+      return ContentService.createTextOutput(JSON.stringify({ok:true, updated:n}))
+             .setMimeType(ContentService.MimeType.JSON);
+    }
+    if(data.action === 'updateNumber'){
+      const n = updateNumber_(sheetName, data.item, data.number);
+      return ContentService.createTextOutput(JSON.stringify({ok:true, updated:n}))
+             .setMimeType(ContentService.MimeType.JSON);
+    }
+    return ContentService.createTextOutput(JSON.stringify({ok:false, error:'unknown action'}))
+           .setMimeType(ContentService.MimeType.JSON);
+  }catch(err){
+    return ContentService.createTextOutput(JSON.stringify({ok:false, error:String(err)}))
+           .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
