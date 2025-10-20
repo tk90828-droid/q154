@@ -43,7 +43,7 @@
 
   /* ===== 11×9 Grid ===== */
   .grid-wrap{margin-top:14px}
-  .grid{display:grid;grid-template-columns:repeat(9,var(--colw));gap:10px;align-items:start}
+  .grid{display:grid;grid-template-columns:repeat(9,var(--colw));gap:10px;align-items:start} /* 值會被 JS 覆寫成 11 欄 */
   .cell{border:1px solid var(--border);border-radius:12px;background:#10131A;padding:8px;display:flex;flex-direction:column;gap:8px}
   .table-name{width:100%;padding:8px 10px;border-radius:10px;border:1px solid var(--border);background:#0f1117;color:#e5e7eb;font-size:13px}
   .drop{min-height:40px;border:2px dashed #2b3244;border-radius:10px;display:grid;place-items:center;padding:6px}
@@ -69,6 +69,15 @@
   .hint{font-size:12px;color:var(--muted)}
 
   .rb{height:2px;background:var(--rainbow);opacity:.6;border-radius:2px;margin:6px 0 10px}
+
+  /* === Save loading spinner === */
+  .btn.loading { opacity:.8; pointer-events:none; position:relative }
+  .btn .spinner {
+    width:14px; height:14px; border:2px solid currentColor; border-right-color:transparent;
+    border-radius:50%; display:inline-block; vertical-align:-2px; margin-left:8px;
+    animation: btnspin .8s linear infinite;
+  }
+  @keyframes btnspin { to { transform: rotate(360deg) } }
 </style>
 </head>
 <body>
@@ -126,29 +135,23 @@
 /* =====================
    (1) 設定區
    ===================== */
-// 1) 雲端名單（與 GAS 無關）：需回傳 Array<Row>
-//    Row 欄位：{ item, number, name, ig, country, flag, leader, link, status }
-const ROSTER_URL = 'https://docs.google.com/spreadsheets/d/1DY4TajQDdvikPfM_-A6St5CCW996NtQkclC2IG4PJ4s/gviz/tq?tqx=out:json&sheet=roster'; // Google Sheets gviz 端點（公開檢視）
+// 雲端名單（gviz）
+const ROSTER_URL = 'https://docs.google.com/spreadsheets/d/1DY4TajQDdvikPfM_-A6St5CCW996NtQkclC2IG4PJ4s/gviz/tq?tqx=out:json&sheet=roster';
+// 儲存時呼叫的 GAS Web App
+const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxJ2_FeuZYGY3N7nf7kfGNG2ADyVMaDF70L4KFoPTHza7BKaFGIvy9hAVJeuZ1a6ecOig/exec';
 
-// 2) 僅在儲存時呼叫 GAS：優先 bulkUpdateNumber（一次回填），fallback updateNumber（逐筆）
-const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxJ2_FeuZYGY3N7nf7kfGNG2ADyVMaDF70L4KFoPTHza7BKaFGIvy9hAVJeuZ1a6ecOig/exec'; // 換成你的 Web App URL（部署權限要「任何人」可存取）
-
-// 3) 固定 11×9
-const ROWS = 11, COLS = 9, CELLS = ROWS * COLS;
-
-// 4) 儲存分批大小（避免超量/逾時）
-const BULK_SIZE = 80;
+// ✅ 固定「11 欄 × 9 列」
+const ROWS = 9, COLS = 11, CELLS = ROWS * COLS;
 
 /* =====================
    (2) 狀態
    ===================== */
 const state = {
-  rows: [],                 // roster（所有人）
-  leaders: [],              // leader 名稱列表（唯一）
-  membersByLeader: new Map(), // Map<leader, Row[]>
-  // 位置：leader -> { type:'dock' } 或 { type:'cell', idx:number }
-  pos: new Map(),
-  swapMode: false,          // false=覆蓋; true=交換
+  rows: [],
+  leaders: [],
+  membersByLeader: new Map(),
+  pos: new Map(),          // leader -> { type:'dock' } | { type:'cell', idx }
+  swapMode: false
 };
 
 /* =====================
@@ -156,18 +159,16 @@ const state = {
    ===================== */
 const $ = sel => document.querySelector(sel);
 const $$ = sel => Array.from(document.querySelectorAll(sel));
-const toast = msg => { const t=$('#toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2500) };
+const toast = msg => { const t=$('#toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000) };
 const setColw = px => { document.documentElement.style.setProperty('--colw', px+'px'); $('#colwVal').textContent = px+'px'; };
 
 /* =====================
    (4) 初始化
    ===================== */
 (async function init(){
-  // 欄寬控制
   $('#colw').addEventListener('input', e=> setColw(e.target.value));
   setColw($('#colw').value);
 
-  // 模式切換（覆蓋 / 交換）
   $('#btnMode').addEventListener('click', ()=>{
     state.swapMode = !state.swapMode;
     const b = $('#btnMode');
@@ -175,7 +176,6 @@ const setColw = px => { document.documentElement.style.setProperty('--colw', px+
     b.textContent = state.swapMode ? '交換模式' : '覆蓋模式';
   });
 
-  // Popover 關閉
   $('#poBack').addEventListener('click', e=>{ if(e.target.id==='poBack') closePopover() });
   $('#poClose').addEventListener('click', closePopover);
 
@@ -194,28 +194,18 @@ async function loadRoster(){
     let text = await res.text();
 
     let rowsArr;
-    // 1) 嘗試純 JSON（陣列或 {rows:[]}）
-    try {
-      const j = JSON.parse(text);
-      rowsArr = Array.isArray(j) ? j : (Array.isArray(j.rows) ? j.rows : null);
-    } catch(_) {}
-
-    // 2) 若不是純 JSON → 解析 gviz JSON
+    try { const j = JSON.parse(text); rowsArr = Array.isArray(j) ? j : (Array.isArray(j.rows) ? j.rows : null); } catch(_) {}
     if(!Array.isArray(rowsArr)){
       const m = text.match(/setResponse\((.*)\);?$/s);
       if(!m) throw new Error('Invalid gviz payload');
       const g = JSON.parse(m[1]);
       const cols = g.table.cols.map(c => (c.label || c.id || '').toString().trim().toLowerCase());
       rowsArr = g.table.rows.map(r => {
-        const obj = {};
-        (r.c||[]).forEach((cell, i) => {
-          obj[cols[i] || ('col'+i)] = (cell && (cell.v ?? cell.f)) ?? '';
-        });
+        const obj = {}; (r.c||[]).forEach((cell, i) => { obj[cols[i] || ('col'+i)] = (cell && (cell.v ?? cell.f)) ?? '' });
         return obj;
       });
     }
 
-    // === 欄位標準化 ===
     const needKeys = ['item','number','name','ig','country','flag','leader','link','status'];
     const normalized = rowsArr.map(r => {
       const o = {};
@@ -229,7 +219,6 @@ async function loadRoster(){
       return o;
     });
 
-    // 依 leader 分組
     const groups = new Map();
     for(const r of normalized){
       const key = (r.leader || '').trim();
@@ -238,33 +227,36 @@ async function loadRoster(){
     }
     state.membersByLeader = groups;
 
-    // 唯一 leaders（排除空字串） → 初始皆在 Dock
     state.leaders = Array.from(groups.keys()).filter(x=>x).sort((a,b)=>a.localeCompare(b));
     state.pos.clear();
     for(const L of state.leaders){ state.pos.set(L, {type:'dock'}); }
     $('#dockCount').textContent = `${state.leaders.length} 位`;
   }catch(err){
     console.error(err);
-    toast('名單載入失敗（確認表單已公開與分頁名 sheet=roster）');
+    toast('名單載入失敗（請確認表單已開放檢視與分頁名 sheet=roster）');
   }
 }
 
 /* =====================
    (6) Dock & Grid 建立 / 更新
    ===================== */
+let dockListenersBound = false;
 function buildDock(){
   const box = $('#dockBody');
   box.innerHTML = '';
-  box.addEventListener('dragover', e=>{e.preventDefault(); box.classList.add('drop-hover')});
-  box.addEventListener('dragleave', ()=> box.classList.remove('drop-hover'));
-  box.addEventListener('drop', e=>{
-    e.preventDefault(); box.classList.remove('drop-hover');
-    const L = e.dataTransfer.getData('text/leader');
-    if(!L) return;
-    moveLeaderToDock(L);
-  });
 
-  // 目前在 dock 的 leaders
+  if(!dockListenersBound){
+    box.addEventListener('dragover', e=>{e.preventDefault(); box.classList.add('drop-hover')});
+    box.addEventListener('dragleave', ()=> box.classList.remove('drop-hover'));
+    box.addEventListener('drop', e=>{
+      e.preventDefault(); box.classList.remove('drop-hover');
+      const L = e.dataTransfer.getData('text/leader');
+      if(!L) return;
+      moveLeaderToDock(L);
+    });
+    dockListenersBound = true;
+  }
+
   const inDock = state.leaders.filter(L => (state.pos.get(L)||{}).type==='dock');
   if(!inDock.length){
     const p = document.createElement('div'); p.className='placeholder'; p.textContent='Dock 目前沒有 Leader'; box.appendChild(p);
@@ -274,13 +266,14 @@ function buildDock(){
 }
 
 function buildGrid(){
-  const g = $('#grid'); g.innerHTML='';
+  const g = $('#grid');
+  g.style.gridTemplateColumns = `repeat(${COLS}, var(--colw))`; // ← 依 COLS 動態控制欄數（11 欄）
+  g.innerHTML='';
   for(let i=0;i<CELLS;i++){
     const cell = document.createElement('div'); cell.className='cell'; cell.dataset.idx=i;
     const input = document.createElement('input'); input.type='text'; input.className='table-name'; input.placeholder='桌名（與欄寬同步）';
     const drop = document.createElement('div'); drop.className='drop'; drop.dataset.dropzone='cell'; drop.innerHTML='<span class="placeholder">Leader 放置區</span>';
 
-    // DnD events
     drop.addEventListener('dragover', e=>{ e.preventDefault(); drop.classList.add('drop-hover') });
     drop.addEventListener('dragleave', ()=> drop.classList.remove('drop-hover'));
     drop.addEventListener('drop', e=>{
@@ -329,7 +322,6 @@ function getLeaderAtCell(idx){
    ===================== */
 function moveLeaderToDock(leader){
   const pos = state.pos.get(leader); if(!pos) return;
-  // 如果在某個 cell，清空該處
   if(pos.type==='cell'){ renderCellLeader(pos.idx); }
   state.pos.set(leader, {type:'dock'});
   buildDock();
@@ -340,22 +332,17 @@ function placeLeaderIntoCell(leader, idx){
   const occupied = getLeaderAtCell(idx);
 
   if(!occupied){
-    // 無人佔用 → 直接放入
-    if(src && src.type==='cell') renderCellLeader(src.idx); // 清掉舊位
+    if(src && src.type==='cell') renderCellLeader(src.idx);
     state.pos.set(leader, {type:'cell', idx});
     renderCellLeader(idx); buildDock();
     return;
   }
 
-  if(occupied === leader){ return; } // 同一人放同格
+  if(occupied === leader){ return; }
 
   if(state.swapMode){
-    // 交換：occupied ↔ leader
-    const occPos = state.pos.get(occupied); // 必為 {cell, idx}
-    const srcPos = src; // 可能是 dock 或 cell
-    // 放 leader -> idx
+    const srcPos = src;
     state.pos.set(leader, {type:'cell', idx});
-    // 放 occupied -> src
     if(srcPos && srcPos.type==='cell'){
       state.pos.set(occupied, {type:'cell', idx: srcPos.idx});
       renderCellLeader(srcPos.idx);
@@ -365,7 +352,6 @@ function placeLeaderIntoCell(leader, idx){
     }
     renderCellLeader(idx);
   } else {
-    // 覆蓋：把原本的送回 Dock，再把 leader 放進來
     const occPos = state.pos.get(occupied);
     state.pos.set(occupied, {type:'dock'});
     state.pos.set(leader, {type:'cell', idx});
@@ -397,16 +383,12 @@ function closePopover(){ $('#poBack').style.display='none'; }
    (9) 自動排列：依 Leader 名稱排序 → 依 11×9 順序填滿
    ===================== */
 $('#btnAuto').addEventListener('click', ()=>{
-  // 全部先回 Dock
   for(const L of state.leaders){ state.pos.set(L,{type:'dock'}); }
   buildDock();
-  // 依名稱排序
   const sorted = [...state.leaders].sort((a,b)=>a.localeCompare(b));
-  // 逐格放入
   let k=0;
   for(let i=0;i<CELLS;i++){
-    const L = sorted[k++];
-    if(!L) break;
+    const L = sorted[k++]; if(!L) break;
     state.pos.set(L,{type:'cell', idx:i});
     renderCellLeader(i);
   }
@@ -414,115 +396,109 @@ $('#btnAuto').addEventListener('click', ()=>{
 });
 
 /* =====================
-   (10) 儲存：對每一格「同時有桌名 + leader」者，回填 leader 全員的 number=桌名(人數)
+   (10) 儲存：同時有「桌名 + leader」的格才回填；只送 item/number
    ===================== */
+const btnSave = $('#btnSave');
 $('#btnSave').addEventListener('click', saveAll);
 
 async function saveAll(){
   if(!GAS_WEB_APP_URL || GAS_WEB_APP_URL.includes('XXXXXXXX')){
     toast('請先設定 GAS_WEB_APP_URL'); return;
   }
-  const payload = [];
-  // 建立 leader → memberCount 對照
-  const countMap = new Map();
-  for(const [L, arr] of state.membersByLeader){ if(!L) continue; countMap.set(L, arr.length); }
 
-  // 收集 99 格
-  const cells = $$('.cell');
-  for(const cell of cells){
-    const idx = parseInt(cell.dataset.idx,10);
-    const tn = (cell.querySelector('.table-name').value || '').trim();
-    const L = getLeaderAtCell(idx);
-    if(!tn || !L) continue; // 必須同時有桌名+leader
-    const count = countMap.get(L)||0;
-    const value = `${tn}(${count})`;
-    const members = state.membersByLeader.get(L)||[];
-    for(const m of members){
-      // item 作為唯一鍵（你表上若以其它欄為鍵，請一併調整 GAS）
-      payload.push({ item:m.item, ig:m.ig, name:m.name, leader:L, number:value });
+  // Loading 開
+  const originalLabel = btnSave.textContent;
+  btnSave.textContent = '儲存中…';
+  btnSave.classList.add('loading');
+  if(!btnSave.querySelector('.spinner')){
+    const sp = document.createElement('span'); sp.className='spinner';
+    btnSave.appendChild(sp);
+  }
+  btnSave.disabled = true;
+
+  try{
+    const payload = [];
+    const countMap = new Map();
+    for(const [L, arr] of state.membersByLeader){ if(!L) continue; countMap.set(L, arr.length); }
+
+    for(const cell of $$('.cell')){
+      const idx = parseInt(cell.dataset.idx,10);
+      const tn = (cell.querySelector('.table-name').value || '').trim();
+      const L = getLeaderAtCell(idx);
+      if(!tn || !L) continue;
+      const count = countMap.get(L)||0;
+      const value = `${tn}(${count})`;
+      const members = state.membersByLeader.get(L)||[];
+      for(const m of members){
+        // 精簡：配合後端只以 item 為唯一鍵
+        payload.push({ item:m.item, number:value });
+      }
     }
-  }
 
-  if(!payload.length){ toast('沒有可儲存的格子'); return; }
+    if(!payload.length){ toast('沒有可儲存的格子'); return; }
 
-  console.group('[SAVE] payload 統計');
-  console.log('總筆數 =', payload.length);
-  console.groupEnd();
+    // 先 bulk
+    const bulkRes = await tryPost(GAS_WEB_APP_URL, JSON.stringify({
+      action:'bulkUpdateNumber', changes: payload, sheet:'roster', ts:Date.now()
+    }));
 
-  // 先嘗試 bulkUpdateNumber（分批）
-  let ok = true;
-  for (let i=0; i<payload.length; i+=BULK_SIZE){
-    const chunk = payload.slice(i, i+BULK_SIZE);
-    const body = JSON.stringify({ action:'bulkUpdateNumber', changes: chunk, sheet:'roster', ts:Date.now() });
-    console.group(`[BULK] ${i}..${i+chunk.length-1}（${chunk.length}筆）`);
-    const res = await tryPost(GAS_WEB_APP_URL, body);
-    console.log('bulk 回覆 =', res);
-    console.groupEnd();
-    if(!res.ok){ ok = false; break; }
-  }
+    if(bulkRes.ok){
+      const nf = (bulkRes.body && Array.isArray(bulkRes.body.notFound)) ? bulkRes.body.notFound.length : 0;
+      toast(`✅ 已回填 ${payload.length - nf} 筆${nf ? `，對不到 ${nf} 筆` : ''}`);
+      if(nf) console.warn('[NOT FOUND items]', bulkRes.body.notFound);
+      return;
+    }
 
-  // fallback 逐筆（只有在 bulk 任一批失敗才啟用）
-  if(!ok){
-    console.warn('bulk 失敗，改走逐筆 updateNumber...');
-    ok = true;
+    // bulk 失敗 → 逐筆
+    console.warn('[BULK FAILED] 改走逐筆更新…', bulkRes);
+    let okCount = 0;
     for(const ch of payload){
-      const body = JSON.stringify({ action:'updateNumber', item: ch.item, ig:ch.ig, name:ch.name, number: ch.number, sheet:'roster', ts:Date.now() });
-      const res = await tryPost(GAS_WEB_APP_URL, body);
-      if(!res.ok){ ok = false; console.error('逐筆失敗：', res); break; }
+      const one = await tryPost(GAS_WEB_APP_URL, JSON.stringify({
+        action:'updateNumber', item: ch.item, number: ch.number, sheet:'roster', ts:Date.now()
+      }));
+      if(one.ok) okCount++;
+      else console.error('[SINGLE FAIL]', ch, one);
     }
+    toast(okCount === payload.length ? `✅ 已回填 ${okCount} 筆（逐筆）` : `⚠️ 部分成功：${okCount}/${payload.length}`);
+  } finally {
+    // Loading 關
+    btnSave.disabled = false;
+    btnSave.textContent = originalLabel;
+    btnSave.classList.remove('loading');
+    const sp = btnSave.querySelector('.spinner'); if(sp) sp.remove();
   }
-
-  toast(ok ? '✅ 已回填 number' : '❌ 回填失敗（詳見 Console）');
 }
 
-/**
- * 統一 POST：避免 preflight，完整解析錯誤
- * - 使用 text/plain 送出字串，減少 CORS 預檢
- * - 回傳 { ok:boolean, status:number, statusText:string, body?:string|object }
- */
 async function tryPost(url, bodyText){
   try{
     const res = await fetch(url, {
       method:'POST',
-      // 關鍵：以 text/plain 送出，避免 application/json 觸發預檢
-      headers:{ 'Content-Type':'text/plain;charset=utf-8' },
+      headers:{ 'Content-Type':'application/json' }, // 如需避免預檢可改 'text/plain;charset=utf-8'
       body: bodyText,
-      cache:'no-store',
-      redirect:'follow',
-      // 不設 no-cors，讓我們能讀取 status 與 body
+      mode:'cors',
+      cache:'no-store'
     });
 
     const out = { ok:false, status:res.status, statusText:res.statusText, body:null };
-
-    // 嘗試解析 body
     let raw = '';
     try { raw = await res.text(); } catch(_){}
     if(raw){
-      try { out.body = JSON.parse(raw); }
-      catch { out.body = raw; }
+      try { out.body = JSON.parse(raw); } catch { out.body = raw; }
     }
 
-    // Apps Script 常見成功格式：{ ok:true } 或陣列/物件
     if(res.ok){
-      if(typeof out.body === 'object'){
-        if(out.body && (out.body.ok === true || Array.isArray(out.body) || Object.keys(out.body).length>=0)){
-          out.ok = true;
-        }else{
-          out.ok = true; // 只要 2xx 就當成功
-        }
+      if(out.body && typeof out.body === 'object' && 'ok' in out.body){
+        out.ok = Boolean(out.body.ok);
       }else{
         out.ok = true;
       }
-    }else{
-      // 非 2xx，也把內容吐出來便於排錯
-      console.error('[GAS ERROR]', out);
-      toast(`GAS 錯誤：${out.status} ${out.statusText}\n${typeof out.body==='string'? out.body : JSON.stringify(out.body)}`);
     }
+
+    if(!out.ok) console.error('[GAS FAIL]', out);
     return out;
   }catch(err){
     console.error('[NETWORK ERROR]', err);
-    toast(`網路或 CORS 失敗：${String(err)}`);
-    return { ok:false, status:0, statusText:String(err) };
+    return { ok:false, status:0, statusText:String(err), body:null };
   }
 }
 </script>
